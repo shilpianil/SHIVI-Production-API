@@ -1,5 +1,7 @@
 import os
 import json
+import base64
+import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
@@ -10,6 +12,7 @@ PORT = int(os.environ.get("PORT", "8001"))
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL = "gemini-3.5-flash-lite"
+GEMINI_VISION_MODEL = os.environ.get("GEMINI_VISION_MODEL", "gemini-3.8-flash")
 
 GEMINI_URL = (
     "https://generativelanguage.googleapis.com/v1beta/interactions"
@@ -483,6 +486,111 @@ def ask_gemini(message, assistant_type):
         )
 
 
+
+# =========================================================
+# GEMINI VISION
+# =========================================================
+
+def ask_gemini_vision(prompt, image_base64, mime_type):
+    """Analyze a base64 image using the Gemini Interactions API."""
+    if not GEMINI_API_KEY:
+        return "Gemini API key is not configured."
+
+    if not isinstance(image_base64, str) or not image_base64.strip():
+        return "image_base64 is required."
+
+    # Accept a data URL such as data:image/png;base64,AAAA...
+    image_base64 = image_base64.strip()
+    if image_base64.startswith("data:"):
+        try:
+            header, image_base64 = image_base64.split(",", 1)
+            match = re.match(r"data:([^;]+);base64", header)
+            if match:
+                mime_type = match.group(1)
+        except ValueError:
+            return "Invalid image data URL."
+
+    try:
+        image_bytes = base64.b64decode(image_base64, validate=True)
+    except Exception:
+        return "Image must be valid base64 data."
+
+    # Keep request size bounded for a small/free web service.
+    if len(image_bytes) > 12 * 1024 * 1024:
+        return "Image is too large. Please choose an image smaller than 12 MB."
+
+    allowed_mime_types = {
+        "image/jpeg", "image/png", "image/webp", "image/gif"
+    }
+    mime_type = str(mime_type or "image/jpeg").lower().strip()
+    if mime_type not in allowed_mime_types:
+        return "Unsupported image type. Use JPEG, PNG, WEBP, or GIF."
+
+    prompt = str(prompt or "").strip()
+    if not prompt:
+        prompt = (
+            "Is image ko dhyan se dekho aur Hindi mein samjhao. "
+            "Agar screenshot hai to visible text aur error bhi batao."
+        )
+
+    payload = {
+        "model": GEMINI_VISION_MODEL,
+        "input": [
+            {"type": "text", "text": prompt},
+            {
+                "type": "image",
+                "data": image_base64,
+                "mime_type": mime_type
+            }
+        ],
+        "system_instruction": (
+            "You are SHIVI, a helpful personal AI assistant. "
+            "Describe the provided image accurately. If the user writes "
+            "in Hindi or Hinglish, respond in Hindi or Hinglish. "
+            "For screenshots, read visible text and explain visible errors. "
+            "Do not claim to see details that are not visible."
+        )
+    }
+
+    request = Request(
+        GEMINI_URL,
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "x-goog-api-key": GEMINI_API_KEY
+        },
+        method="POST"
+    )
+
+    try:
+        with urlopen(request, timeout=90) as response:
+            result = json.loads(response.read().decode("utf-8"))
+
+        answer = extract_text_from_result(result)
+        if answer:
+            return answer
+        return "Gemini Vision returned a response, but no text was found."
+
+    except HTTPError as e:
+        try:
+            error_body = e.read().decode("utf-8")
+        except Exception:
+            error_body = ""
+        print("[GEMINI VISION HTTP ERROR]", e.code, error_body[:2000])
+        return "Gemini Vision API error " + str(e.code) + ": " + error_body[:700]
+
+    except URLError as e:
+        print("[GEMINI VISION NETWORK ERROR]", repr(e))
+        return "Gemini Vision network error: " + str(e.reason)
+
+    except TimeoutError:
+        return "Gemini Vision request timed out."
+
+    except Exception as e:
+        print("[GEMINI VISION ERROR]", repr(e))
+        return "Gemini Vision error: " + str(e)
+
+
 # =========================================================
 # HTTP SERVER
 # =========================================================
@@ -588,18 +696,65 @@ class SHIVIProductionHandler(
 
     def do_POST(self):
 
-        if self.path != "/chat":
+        if self.path == "/vision":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if length <= 0 or length > 18 * 1024 * 1024:
+                    self.send_json(
+                        {"ok": False, "error": "Invalid request size."},
+                        413 if length > 18 * 1024 * 1024 else 400
+                    )
+                    return
 
-            self.send_json(
-                {
-                    "ok": False,
-                    "error": "Not found"
-                },
-                404
-            )
+                raw = self.rfile.read(length)
+                data = json.loads(raw.decode("utf-8"))
 
+                image_base64 = (
+                    data.get("image_base64")
+                    or data.get("imageBase64")
+                    or data.get("image")
+                    or data.get("base64")
+                    or ""
+                )
+                prompt = data.get("prompt") or data.get("message") or ""
+                mime_type = data.get("mime_type") or data.get("mimeType") or "image/jpeg"
+
+                answer = ask_gemini_vision(prompt, image_base64, mime_type)
+                ok = not answer.startswith((
+                    "Gemini API key is not configured.",
+                    "image_base64 is required.",
+                    "Image must be valid base64 data.",
+                    "Unsupported image type.",
+                    "Image is too large.",
+                    "Invalid image data URL.",
+                    "Gemini Vision API error",
+                    "Gemini Vision network error",
+                    "Gemini Vision request timed out.",
+                    "Gemini Vision error:",
+                    "Gemini Vision returned a response, but no text was found."
+                ))
+                self.send_json(
+                    {
+                        "ok": ok,
+                        "answer": answer,
+                        "model": GEMINI_VISION_MODEL
+                    },
+                    200 if ok else 502
+                )
+            except Exception as e:
+                print("[SHIVI VISION REQUEST ERROR]", repr(e))
+                self.send_json(
+                    {"ok": False, "error": "Invalid vision request: " + str(e)},
+                    400
+                )
             return
 
+        if self.path != "/chat":
+            self.send_json(
+                {"ok": False, "error": "Not found"},
+                404
+            )
+            return
 
         try:
 
